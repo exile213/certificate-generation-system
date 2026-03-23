@@ -60,28 +60,31 @@ export function prepareData(studentsChunk: Record<string, string>[], fieldRepeat
 }
 
 /**
- * Build a Docxtemplater instance with a custom parser that maps array values
- * to the correct {{tag}} slot based on its position in the document.
+ * Build a Docxtemplater instance with a first-page-block-based value-index mapping.
  *
- * `effectiveCounts` is optional: when provided, it limits how many lIndexes are
- * tracked per tag to exactly that count.  This prevents an "extra" hidden/shadow
- * occurrence from stealing an array slot and leaving a visible certificate blank.
+ * The TemplatesPage uses the same split regex to count how many distinct tag
+ * occurrences appear on the "first certificate block" of the template — that count
+ * becomes fieldOccurrences[tag] (= the number of students per document).
  *
- * Without the limit, 3 occurrences with data = ["Emil","Peter"] would map as:
- *   lIndex[0] → "Emil"   (visible Cert of Participation)
- *   lIndex[1] → "Peter"  (hidden/extra occurrence — steals the slot)
- *   lIndex[2] → ""       (visible Cert of Appearance — left blank!)
+ * For the generator, we mirror that split to assign slot indices:
+ *   • Occurrences inside firstPageXml  → sequential slot 0, 1, 2 …
+ *   • Occurrences after firstPageXml   → same as the LAST slot (limit−1)
  *
- * With effectiveCounts["name"] = 2, only the FIRST 2 lIndexes are registered.
- * The extra occurrence (whichever lIndex it has) falls outside the tracked set
- * and safely defaults to values[0], keeping the visible certificates intact.
+ * Example (2-cert template, data["name"] = ["Emil","Peter"]):
+ *   charPos 70438  (Cert Participation — inside firstPage) → slot 0 → "Emil"  ✓
+ *   charPos 100233 (Cert Appearance bold — inside firstPage) → slot 1 → "Peter" ✓
+ *   charPos 117141 (Cert Appearance inline — after firstPage) → slot 1 → "Peter" ✓
+ *
+ * The split regex is identical to what TemplatesPage uses so the slot count
+ * always matches fieldOccurrences.
  */
 function createDocxtemplater(
   zip: PizZip,
   effectiveCounts: Record<string, number> = {}
 ): Docxtemplater {
-  const tagOccurrences: Record<string, number[]> = {};
-  
+  // Maps tag → { lIndex → valueArrayIndex }
+  const lIndexValueMap: Record<string, Record<number, number>> = {};
+
   const doc = new Docxtemplater(zip, {
     paragraphLoop: true,
     linebreaks: true,
@@ -92,32 +95,38 @@ function createDocxtemplater(
           const cleanTag = tag.trim();
           const lIndex = context.meta.part.lIndex;
           const values = scope[cleanTag];
-          
-          if (tagOccurrences[cleanTag]) {
-            const index = tagOccurrences[cleanTag].indexOf(lIndex);
-            if (Array.isArray(values)) {
-              if (index !== -1) {
-                return index < values.length ? values[index] : '';
-              } else {
-                // Tag is outside the tracked set (header/footer/extra occurrence) —
-                // default to first value so it stays consistent.
-                return values[0] || '';
-              }
+
+          if (!Array.isArray(values)) return values;
+
+          const valueMap = lIndexValueMap[cleanTag];
+          let valueIndex = 0;
+
+          if (valueMap) {
+            const mapped = valueMap[lIndex];
+            if (mapped !== undefined) {
+              valueIndex = mapped;
             }
-          } else if (Array.isArray(values)) {
-            return values[0] || '';
           }
-          
-          return values;
+
+          const result = valueIndex < values.length ? values[valueIndex] : values[values.length - 1] || '';
+
+          return result;
         }
       };
     }
   });
 
-  // @ts-ignore - accessing internal compiled property to find tag offsets
+  // @ts-ignore
   const compiled = doc.compiled;
   if (compiled) {
-    // Collect all lIndexes from the main document body first.
+    const docXml = zip.file('word/document.xml')?.asText() || '';
+
+    // Mirror exactly the TemplatesPage firstPageXml split so our slot boundaries match.
+    const pageBlockSplitRe = /<w:br\b[^>]*w:type="page"[^>]*\/>|<w:sectPr[\s\S]*?<\/w:sectPr>/i;
+    const firstPageXml = docXml.split(pageBlockSplitRe)[0] || docXml;
+    const firstPageEndPos = firstPageXml.length; // = start of the matched split block in docXml
+
+    // Collect all lIndexes from word/document.xml
     const allTagLIndexes: Record<string, number[]> = {};
     Object.entries(compiled).forEach(([fileName, file]: [string, any]) => {
       if (fileName === 'word/document.xml' && file.parsed) {
@@ -131,15 +140,40 @@ function createDocxtemplater(
       }
     });
 
-    // Sort each list ascending (document order) then slice to the effective
-    // count so that any extra occurrences beyond what the template "intends"
-    // don't consume an array slot meant for a visible certificate.
+    const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
     Object.entries(allTagLIndexes).forEach(([tag, lIndexes]) => {
       lIndexes.sort((a, b) => a - b);
-      const limit = effectiveCounts[tag];
-      tagOccurrences[tag] = limit && limit < lIndexes.length
-        ? lIndexes.slice(0, limit)
-        : lIndexes;
+
+      const limit = effectiveCounts[tag] || 1;
+      const tagRe = new RegExp(`\\{\\{\\s*${escRe(tag)}\\s*\\}\\}`, 'g');
+      const allCharPositions: number[] = [];
+      let cm;
+      while ((cm = tagRe.exec(docXml)) !== null) allCharPositions.push(cm.index);
+
+      const map: Record<number, number> = {};
+
+      if (allCharPositions.length === lIndexes.length) {
+        // Occurrences inside firstPageXml are the canonical slots (in document order).
+        // Occurrences outside get the same slot as the last canonical occurrence.
+        const primaryPositions = allCharPositions.filter(pos => pos < firstPageEndPos);
+        const lastSlot = Math.max(0, primaryPositions.length - 1);
+
+        allCharPositions.forEach((pos, i) => {
+          let slotIdx: number;
+          if (pos < firstPageEndPos) {
+            slotIdx = primaryPositions.indexOf(pos);
+          } else {
+            slotIdx = lastSlot;
+          }
+          map[lIndexes[i]] = Math.min(slotIdx, limit - 1);
+        });
+      } else {
+        // Fallback: sequential, clamped to last slot.
+        lIndexes.forEach((li, i) => { map[li] = Math.min(i, limit - 1); });
+      }
+
+      lIndexValueMap[tag] = map;
     });
   }
 
